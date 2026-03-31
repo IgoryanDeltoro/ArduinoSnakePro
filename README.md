@@ -13,6 +13,18 @@ Snake Pro is a modern, IoT-enabled take on the classic arcade game, built on the
 * **Dynamic Level Loading via SD:** Game maps are parsed from `.txt` files stored on an external SD card, allowing for modular map design without flashing the board.
 * **Non-Blocking Audio & Graphics:** Utilizes an Adafruit ST7735 TFT display and a passive buzzer. Game logic runs asynchronously, ensuring screen updates and PWM audio do not halt the server network requests.
 
+## 📸 Gallery
+| Smartphone Controller | HardWare Screen |
+| :---: | :---: |
+| ![Controller UI](media/menu.jpg) | ![Gameplay](media/boot.jpg) |
+| ![Controller UI](media/controller.jpg) | ![Gameplay](media/game.jpg) |
+
+
+<div align="center">
+  <video src="media/video.mp4" width="100%" autoplay loop muted playsinline>Video Accompaniment</video>
+</div>
+
+
 ## 🛠️ Hardware Requirements (BoM)
 
 | Component | Description |
