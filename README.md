@@ -21,7 +21,7 @@ Snake Pro is a modern, IoT-enabled take on the classic arcade game, built on the
 
 
 <div align="center">
-  <video src="media/video.mp4" width="100%" autoplay loop muted playsinline>Video Accompaniment</video>
+  <video src="https://github.com/IgoryanDeltoro/ArduinoSnakePro/blob/main/media/video.mp4" width="100%" autoplay loop muted playsinline></video>
 </div>
 
 
