@@ -1,6 +1,7 @@
 /**
- * @file snake.ino
+ * @file snake.ino 
  * @brief Snake Pro - A WiFi-controlled Snake clone for Arduino Nano RP2040 Connect
+ * @brief This is a prototype project that is currently undergoing further development
  * @details Features an embedded web server acting as a smartphone controller, 
  * SD card level loading, captive portal DNS, and an ST7735 TFT display.
  */
