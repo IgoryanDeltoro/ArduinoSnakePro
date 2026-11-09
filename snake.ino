@@ -1,58 +1,65 @@
 /**
- * @file snake.ino 
+ * @file snake.ino
  * @brief Snake Pro - A WiFi-controlled Snake clone for Arduino Nano RP2040 Connect
  * @brief This is a prototype project that is currently undergoing further development
- * @details Features an embedded web server acting as a smartphone controller, 
+ * @details Features an embedded web server acting as a smartphone controller,
  * SD card level loading, captive portal DNS, and an ST7735 TFT display.
  */
 
 #include <SPI.h>
 #include <SD.h>
-#include <WiFiNINA_Generic.h>   
-#include <WiFiWebServer.h>  
+#include <WiFiNINA_Generic.h>
+#include <WiFiWebServer.h>
 #include <WiFiUdp_Generic.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7735.h>
 #include "pitches.h"
 
 // --- HARDWARE & PIN DEFINITIONS ---
-#define TFT_CS    10 
-#define TFT_RST   9
-#define TFT_DC    8
-#define SD_CS_PIN 4
+#define TFT_CS     10
+#define TFT_RST    9
+#define TFT_DC     8
+#define SD_CS_PIN  4
 #define BUZZER_PIN 3
 
 Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
 
 // --- NETWORK CONFIGURATION ---
-const char ssid[] = "Snake_Pro_Network";        
-const char pass[] = "12345678"; 
-WiFiWebServer server(80); 
+const char ssid[] = "Snake_Pro_Network";
+const char pass[] = "12345678";
+WiFiWebServer server(80);
 WiFiUDP dnsUDP;
-const byte DNS_PORT = 53;
+const uint16_t DNS_PORT       = 53;
+const int      DNS_HEADER_LEN = 12;   
+const int      DNS_MAX_PACKET = 512;  
 IPAddress apIP(192, 168, 4, 1);
 IPAddress lastClientIP;
 
 // --- GAME STATE & VARIABLES ---
 enum GameState { MENU, PLAYING, GAMEOVER, WAIT_CONNECT, ERROR_STATE, LOADING };
-GameState currentState = WAIT_CONNECT;
+GameState     currentState = WAIT_CONNECT;
+bool          needsRedraw  = true;     
+unsigned long stateSince   = 0;        
+const char   *errorMsg     = "";       
 
-const int MAP_WIDTH = 20;
-const int MAP_HEIGHT = 16;
-const int MAX_SNAKE_LEN = MAP_WIDTH * MAP_HEIGHT; 
+const int MAP_WIDTH     = 20;
+const int MAP_HEIGHT    = 16;
+const int TILE_SIZE     = 8;           
+const int MAX_SNAKE_LEN = MAP_WIDTH * MAP_HEIGHT;
 char gameMap[MAP_HEIGHT][MAP_WIDTH];
-int snake_coord[MAX_SNAKE_LEN][2]; 
-int snakeLen = 0;
-char direction = 'R';
+int  snake_coord[MAX_SNAKE_LEN][2];    
+int  snakeLen  = 0;
+char direction = 'R';                  
+char movedDir  = 'R';                  
 
-unsigned long lastMoveTime;
-int speedInterval = 350; 
+unsigned long       lastMoveTime  = 0;
+const unsigned long speedInterval = 350;   
+const unsigned long GAMEOVER_MS   = 2000;
 unsigned int currentLevel = 0;
-const char* fileLvlName = "currLvl.txt";
 
-// --- AUDIO CONFIGURATION ---
+// --- AUDIO CONFIGURATION (not used yet) ---
 const int totalNotes = 16;
-int noteDuration = 200; 
+int noteDuration = 200;
 unsigned long lastNoteTime = 0;
 unsigned long previousMillis = 0;
 int currentNote = 0;
@@ -110,244 +117,315 @@ const char controllerHTML[] PROGMEM = R"=====(
 </html>
 )=====";
 
-// --- UTILITY & HARDWARE INITIALIZATION ---
+// --- STATE HELPERS ---
+void setState(GameState s) {
+  currentState = s;
+  stateSince   = millis();
+  needsRedraw  = true;
+}
+
+// --- DISPLAY HELPERS ---
 void initDisplay() {
   tft.fillScreen(ST77XX_BLACK);
   tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(0,0);
+  tft.setCursor(0, 0);
   tft.setTextSize(1);
 }
 
-void printError(const char *msg) {
+void showMessage(const char *msg, uint8_t size, int16_t x, int16_t y, uint16_t color) {
   initDisplay();
-  tft.setCursor(1, 30);
-  tft.setTextColor(ST77XX_RED);
+  tft.setCursor(x, y);
+  tft.setTextSize(size);
+  tft.setTextColor(color);
   tft.println(msg);
+  needsRedraw = false;
+}
+
+static inline bool isEmptyCell(char c) {
+  return c == '0' || c == 0 || c == ' ';
+}
+
+uint16_t tileColor(char c) {
+  switch (c) {
+    case '1': return ST77XX_WHITE;
+    case 'S': return ST77XX_GREEN;
+    case 'F': return ST77XX_RED;
+    default:  return ST77XX_BLACK;
+  }
+}
+
+void drawTile(int y, int x) {
+  tft.fillRect(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE, tileColor(gameMap[y][x]));
+}
+
+void renderMap() { 
+  for (int y = 0; y < MAP_HEIGHT; y++)
+    for (int x = 0; x < MAP_WIDTH; x++)
+      drawTile(y, x);
 }
 
 // --- NETWORK FUNCTIONS ---
 void respondToDNS() {
   int packetSize = dnsUDP.parsePacket();
-  if (packetSize > 0) {
-    byte packetBuffer[512];
-    dnsUDP.read(packetBuffer, packetSize);
-    packetBuffer[2] |= 0x80; 
-    packetBuffer[3] |= 0x80; 
-    packetBuffer[6] = 0; packetBuffer[7] = 1; 
-    dnsUDP.beginPacket(dnsUDP.remoteIP(), dnsUDP.remotePort());
-    dnsUDP.write(packetBuffer, packetSize);
-    dnsUDP.write((uint8_t)0xc0); dnsUDP.write((uint8_t)0x0c);
-    dnsUDP.write((uint8_t)0x00); dnsUDP.write((uint8_t)0x01);
-    dnsUDP.write((uint8_t)0x00); dnsUDP.write((uint8_t)0x01);
-    dnsUDP.write((uint8_t)0x00); dnsUDP.write((uint8_t)0x00);
-    dnsUDP.write((uint8_t)0x00); dnsUDP.write((uint8_t)0x3c);
-    dnsUDP.write((uint8_t)0x00); dnsUDP.write((uint8_t)0x04);
-    dnsUDP.write(apIP[0]); dnsUDP.write(apIP[1]);
-    dnsUDP.write(apIP[2]); dnsUDP.write(apIP[3]);
-    dnsUDP.endPacket();
-  }
-}
+  if (packetSize <= 0) return;
 
-void handleRoot() {
-  IPAddress currentIP = server.client().remoteIP();
-  if (currentIP != lastClientIP) {
-    currentState = MENU;
-    lastClientIP = currentIP;
-  }
+  if (packetSize < DNS_HEADER_LEN || packetSize > DNS_MAX_PACKET) return; 
 
-  if (server.hasArg("start")) {
-    currentState = LOADING;
-    int reqLvl = server.arg("lvl").toInt();
-    currentLevel = (reqLvl > 0 && reqLvl <= 3) ? reqLvl : 1; 
+  byte buf[DNS_MAX_PACKET];
+  int len = dnsUDP.read(buf, packetSize);
+  if (len < DNS_HEADER_LEN) return;
+  if (buf[2] & 0x80) return;                
 
-    String filename = "/maps/level" + String(currentLevel) + ".txt";
-    loadMap(filename.c_str()); 
-    
-    tft.fillScreen(ST77XX_BLACK);
-    renderMap();
-    server.send(200, "text/plain", "Game Started");
-    currentState = PLAYING; 
-    return;
-  } 
-  else if (server.hasArg("dir")) {
-    String dirArg = server.arg("dir");
-    if (dirArg == "U" && direction != 'D') direction = 'U';
-    else if (dirArg == "D" && direction != 'U') direction = 'D';
-    else if (dirArg == "L" && direction != 'R') direction = 'L';
-    else if (dirArg == "R" && direction != 'L') direction = 'R';
-    server.send(200, "text/plain", "OK");
-    return;
-  } 
-  else if (server.hasArg("stop")) {
-    memset(gameMap, 0, sizeof(gameMap));
-    memset(snake_coord, 0, sizeof(snake_coord));
-    direction = 'D';
-    currentState = MENU; 
-    tft.fillScreen(ST77XX_BLACK);
-    server.send(200, "text/plain", "Stopped");
-    return;
+  int pos = DNS_HEADER_LEN;
+  while (pos < len && buf[pos] != 0) {
+    if (buf[pos] & 0xC0) return;             
+    pos += buf[pos] + 1;                     
   }
-  server.send_P(200, "text/html", controllerHTML);
+  pos += 1 + 4;                             
+  if (pos > len) return;                     
+
+  buf[2] |= 0x80;                           
+  buf[3] |= 0x80;                           
+  buf[4] = 0;  buf[5] = 1;                  
+  buf[6] = 0;  buf[7] = 1;                   
+  buf[8] = buf[9] = buf[10] = buf[11] = 0;  
+
+  const uint8_t answer[] = {
+    0xC0, 0x0C,             
+    0x00, 0x01,              
+    0x00, 0x01,             
+    0x00, 0x00, 0x00, 0x3C,  
+    0x00, 0x04              
+  };
+  const uint8_t ip[4] = { apIP[0], apIP[1], apIP[2], apIP[3] };
+
+  dnsUDP.beginPacket(dnsUDP.remoteIP(), dnsUDP.remotePort());
+  dnsUDP.write(buf, pos);                  
+  dnsUDP.write(answer, sizeof(answer));
+  dnsUDP.write(ip, sizeof(ip));
+  dnsUDP.endPacket();
 }
 
 // --- FILE SYSTEM (SD) FUNCTIONS ---
-void loadMap(const char *map) {
-  if (!SD.exists(map)) return;
-  File myFile = SD.open(map, FILE_READ);
-  if (myFile) {
-    snakeLen = 0;
-    int row = 0;
-    while (myFile.available() && row < MAP_HEIGHT) {
-      String line = myFile.readStringUntil('\n');
-      line.trim(); 
-      for (int col = 0; col < MAP_WIDTH && col < line.length(); col++) {
-        gameMap[row][col] = line[col];
-        if (gameMap[row][col] == 'S' && snakeLen < MAX_SNAKE_LEN) {
-          snake_coord[snakeLen][0] = row;
-          snake_coord[snakeLen][1] = col;
-          snakeLen++;
-        }
-      }
-      row++;
+bool loadMap(const char *path) {
+  memset(gameMap, '0', sizeof(gameMap));
+  snakeLen = 0;
+
+  File f = SD.open(path, FILE_READ);
+  if (!f) return false;
+
+  int row = 0, col = 0;
+  while (f.available() && row < MAP_HEIGHT) {
+    char c = f.read();
+    if (c == '\r') continue;                
+    if (c == '\n') { row++; col = 0; continue; }
+    if (col >= MAP_WIDTH) continue;          
+    gameMap[row][col] = c;
+    if (c == 'S' && snakeLen < MAX_SNAKE_LEN) {
+      snake_coord[snakeLen][0] = row;
+      snake_coord[snakeLen][1] = col;
+      snakeLen++;
     }
-    myFile.close();
+    col++;
   }
+  f.close();
+  return snakeLen > 0;                       
 }
 
-// --- GAME LOGIC & RENDERING ---
-void renderMap() {
-  int tileSize = 8;
-  for (int y = 0; y < MAP_HEIGHT; y++) {
-    for (int x = 0; x < MAP_WIDTH; x++) {
-      uint16_t color;
-      switch (gameMap[y][x]) {
-        case '1': color = ST77XX_WHITE; break; 
-        case 'S': color = ST77XX_GREEN; break; 
-        case 'F': color = ST77XX_RED;   break; 
-        default:  color = ST77XX_BLACK; break; 
-      }
-      tft.fillRect(x * tileSize, y * tileSize, tileSize, tileSize, color);
-    }
-  }
+// --- GAME LOGIC ---
+bool hasFood() {
+  for (int y = 0; y < MAP_HEIGHT; y++)
+    for (int x = 0; x < MAP_WIDTH; x++)
+      if (gameMap[y][x] == 'F') return true;
+  return false;
 }
 
-void moveSnake(int nY, int nX, int pY, int pX){
-    if (nY < 0 || nY >= MAP_HEIGHT || nX < 0 || nX >= MAP_WIDTH || gameMap[nY][nX] == '1' || gameMap[nY][nX] == 'S') {
-      currentState = GAMEOVER;
+void spawnFood() {
+  for (int attempts = 0; attempts < 100; attempts++) {
+    int ry = 1 + random(MAP_HEIGHT - 2);   
+    int rx = 1 + random(MAP_WIDTH - 2);
+    if (isEmptyCell(gameMap[ry][rx])) {
+      gameMap[ry][rx] = 'F';
+      drawTile(ry, rx);
       return;
     }
+  }
+}
 
-    if (gameMap[nY][nX] == 'F') {
-      gameMap[nY][nX] = 'S';
-      if (snakeLen < MAX_SNAKE_LEN) {
-        snake_coord[snakeLen][0] = nY;
-        snake_coord[snakeLen][1] = nX;
-        snakeLen++;
-      }
-      
-      int attempts = 0;
-      while (attempts < 100) {
-        int ry = 1 + (rand() % (MAP_HEIGHT - 2));
-        int rx = 1 + (rand() % (MAP_WIDTH - 2));
-        if (gameMap[ry][rx] == '0' || gameMap[ry][rx] == 0) {
-          gameMap[ry][rx] = 'F';
-          break;
-        }
-        attempts++;
-      }
-    } else {
-      gameMap[nY][nX] = 'S'; 
-      gameMap[snake_coord[0][0]][snake_coord[0][1]] = '0';
-      for (int i = 1; i < snakeLen; i++) {
-        snake_coord[i - 1][0] = snake_coord[i][0];
-        snake_coord[i - 1][1] = snake_coord[i][1];
-      }
-      snake_coord[snakeLen - 1][0] = nY;
-      snake_coord[snakeLen - 1][1] = nX;
+void gameOver() {
+  setState(GAMEOVER);
+}
+
+void moveSnake(int nY, int nX) {
+  if (nY < 0 || nY >= MAP_HEIGHT || nX < 0 || nX >= MAP_WIDTH || gameMap[nY][nX] == '1') {
+    gameOver();
+    return;
+  }
+
+  int tailY = snake_coord[0][0];
+  int tailX = snake_coord[0][1];
+
+  if (gameMap[nY][nX] == 'S' && !(nY == tailY && nX == tailX)) {
+    gameOver();
+    return;
+  }
+
+  if (gameMap[nY][nX] == 'F') {
+    if (snakeLen < MAX_SNAKE_LEN) {
+      snake_coord[snakeLen][0] = nY;
+      snake_coord[snakeLen][1] = nX;
+      snakeLen++;
     }
+    gameMap[nY][nX] = 'S';
+    drawTile(nY, nX);
+    spawnFood();
+  } else {
+    gameMap[tailY][tailX] = '0';
+    drawTile(tailY, tailX);
+    for (int i = 1; i < snakeLen; i++) {
+      snake_coord[i - 1][0] = snake_coord[i][0];
+      snake_coord[i - 1][1] = snake_coord[i][1];
+    }
+    snake_coord[snakeLen - 1][0] = nY;
+    snake_coord[snakeLen - 1][1] = nX;
+    gameMap[nY][nX] = 'S';
+    drawTile(nY, nX);
+  }
 }
 
 void handleGame() {
-    switch (direction) {
-      case 'U': moveSnake(snake_coord[snakeLen - 1][0] - 1, snake_coord[snakeLen - 1][1], snake_coord[snakeLen - 1][0], snake_coord[snakeLen - 1][1]); break;
-      case 'D': moveSnake(snake_coord[snakeLen - 1][0] + 1, snake_coord[snakeLen - 1][1], snake_coord[snakeLen - 1][0], snake_coord[snakeLen - 1][1]); break;
-      case 'R': moveSnake(snake_coord[snakeLen - 1][0], snake_coord[snakeLen - 1][1] + 1, snake_coord[snakeLen - 1][0], snake_coord[snakeLen - 1][1]); break;
-      case 'L': moveSnake(snake_coord[snakeLen - 1][0], snake_coord[snakeLen - 1][1] - 1, snake_coord[snakeLen - 1][0], snake_coord[snakeLen - 1][1]); break;
+  if (snakeLen <= 0) { gameOver(); return; } 
+  int hY = snake_coord[snakeLen - 1][0];
+  int hX = snake_coord[snakeLen - 1][1];
+  switch (direction) {
+    case 'U': hY--; break;
+    case 'D': hY++; break;
+    case 'L': hX--; break;
+    case 'R': hX++; break;
   }
+  movedDir = direction;                     
+  moveSnake(hY, hX);
+}
+
+// --- HTTP HANDLER ---
+void handleRoot() {
+  IPAddress currentIP = server.client().remoteIP();
+  if (currentIP != lastClientIP) {
+    lastClientIP = currentIP;
+    if (currentState == WAIT_CONNECT) setState(MENU);
+  }
+
+  if (server.hasArg("start")) {
+    int reqLvl = server.arg("lvl").toInt();
+    currentLevel = (reqLvl >= 1 && reqLvl <= 3) ? reqLvl : 1;
+
+    char filename[24];                                           
+    snprintf(filename, sizeof(filename), "/maps/level%u.txt", currentLevel);
+
+    if (!loadMap(filename)) {                                   
+      errorMsg = "Map load failed";
+      setState(ERROR_STATE);
+      server.send(500, "text/plain", "Map load failed");
+      return;
+    }
+
+    randomSeed(micros());                    
+    direction = movedDir = 'R';          
+    if (!hasFood()) spawnFood();          
+
+    tft.fillScreen(ST77XX_BLACK);
+    renderMap();
+    lastMoveTime = millis();
+    setState(PLAYING);
+    needsRedraw = false;                 
+    server.send(200, "text/plain", "Game Started");
+    return;
+  }
+
+  if (server.hasArg("dir")) {
+    char d = server.arg("dir").charAt(0);   
+    if      (d == 'U' && movedDir != 'D') direction = 'U';
+    else if (d == 'D' && movedDir != 'U') direction = 'D';
+    else if (d == 'L' && movedDir != 'R') direction = 'L';
+    else if (d == 'R' && movedDir != 'L') direction = 'R';
+    server.send(200, "text/plain", "OK");
+    return;
+  }
+
+  if (server.hasArg("stop")) {
+    memset(gameMap, 0, sizeof(gameMap));
+    memset(snake_coord, 0, sizeof(snake_coord));
+    snakeLen  = 0;                       
+    direction = movedDir = 'R';             
+    setState(MENU);
+    server.send(200, "text/plain", "Stopped");
+    return;
+  }
+
+  server.send_P(200, "text/html", controllerHTML);
 }
 
 // --- MAIN ARDUINO ROUTINES ---
 void setup() {
   Serial.begin(115200);
 
-  // Isolate SPI devices
-  pinMode(TFT_CS, OUTPUT); digitalWrite(TFT_CS, HIGH);
+  pinMode(TFT_CS, OUTPUT);    digitalWrite(TFT_CS, HIGH);
   pinMode(SD_CS_PIN, OUTPUT); digitalWrite(SD_CS_PIN, HIGH);
 
   tft.initR(INITR_BLACKTAB);
   tft.setRotation(1);
   initDisplay();
-  
+
+  setState(WAIT_CONNECT);
+
   if (!SD.begin(SD_CS_PIN)) {
-      printError("SD Init Failed.");
+    errorMsg = "SD Init Failed.";
+    setState(ERROR_STATE);
   }
 
-  WiFi.beginAP(ssid, pass);  
-  int timeout = 0;
-  while (WiFi.status() != WL_CONNECTED && timeout < 20) {
-    delay(500); timeout++;
+  if (WiFi.beginAP(ssid, pass) != WL_AP_LISTENING) {
+    errorMsg = "WiFi AP failed.";
+    setState(ERROR_STATE);
   }
 
   dnsUDP.begin(DNS_PORT);
   server.onNotFound([]() {
-    server.sendHeader("Location", "/", true);
-    server.send(302, "text/plain", ""); 
+    server.sendHeader("Location", "http://192.168.4.1/", true);
+    server.send(302, "text/plain", "");
   });
   server.on("/", handleRoot);
   server.begin();
-  
-  lastMoveTime = millis();
 }
 
 void loop() {
   respondToDNS();
-  server.handleClient(); 
+  server.handleClient();
 
   switch (currentState) {
+    case WAIT_CONNECT:
+      if (needsRedraw) showMessage("Connect to WiFi...", 1, 1, 50, ST77XX_GREEN); 
+      break;
+
     case MENU:
-      initDisplay();
-      tft.setCursor(10, 35); 
-      tft.setTextSize(2);
-      tft.setTextColor(ST77XX_GREEN);
-      tft.println("WAITING FOR\nCONTROLLER");
+      if (needsRedraw) showMessage("WAITING FOR\nCONTROLLER", 2, 10, 35, ST77XX_GREEN);  
       break;
 
     case PLAYING:
       if (millis() - lastMoveTime >= speedInterval) {
-        handleGame(); 
-        renderMap();  
         lastMoveTime = millis();
+        handleGame();                       
       }
       break;
 
     case GAMEOVER:
-      initDisplay();
-      tft.setCursor(20, 50);
-      tft.setTextColor(ST77XX_RED);
-      tft.setTextSize(2);
-      tft.println("GAME OVER");
-      delay(2000); 
-      currentState = WAIT_CONNECT; 
+      if (needsRedraw) showMessage("GAME OVER", 2, 20, 50, ST77XX_RED);
+      if (millis() - stateSince >= GAMEOVER_MS) setState(MENU); 
       break;
 
-    case WAIT_CONNECT:
-      initDisplay();
-      tft.setCursor(1, 50);
-      tft.setTextColor(ST77XX_GREEN);
-      tft.println("Connect to WiFi...");
-      delay(250);
+    case ERROR_STATE:
+      if (needsRedraw) showMessage(errorMsg, 1, 1, 30, ST77XX_RED); 
       break;
-      
+
     default:
       break;
   }
